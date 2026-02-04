@@ -150,7 +150,6 @@ class StreamProcessor(BaseProcessor):
         super().__init__(model, token)
         self.response_id: Optional[str] = None
         self.fingerprint: str = ""
-        self.think_opened: bool = False
         self.role_sent: bool = False
         self.filter_tags = get_config("grok.filter_tags", [])
         self.image_format = get_config("app.image_format", "url")
@@ -255,10 +254,8 @@ class StreamProcessor(BaseProcessor):
 
                 # 图像生成进度
                 if img := resp.get("streamingImageGenerationResponse"):
+                    # 进度信息直接输出到 content（不使用 <think> 标签）
                     if self.show_think:
-                        if not self.think_opened:
-                            yield self._sse("<think>\n")
-                            self.think_opened = True
                         idx = img.get("imageIndex", 0) + 1
                         progress = img.get("progress", 0)
                         yield self._sse(
@@ -268,11 +265,9 @@ class StreamProcessor(BaseProcessor):
 
                 # modelResponse
                 if mr := resp.get("modelResponse"):
-                    if self.think_opened and self.show_think:
-                        if msg := mr.get("message"):
-                            yield self._sse(msg + "\n")
-                        yield self._sse("</think>\n")
-                        self.think_opened = False
+                    # 输出 message（如果有）
+                    if self.show_think and (msg := mr.get("message")):
+                        yield self._sse(msg + "\n")
 
                     # 处理生成的图片
                     for url in mr.get("generatedImageUrls", []):
@@ -308,8 +303,7 @@ class StreamProcessor(BaseProcessor):
                         if filtered:
                             yield self._sse(filtered)
 
-            if self.think_opened:
-                yield self._sse("</think>\n")
+            # 流结束
             yield self._sse(finish="stop")
             yield "data: [DONE]\n\n"
         except asyncio.CancelledError:
@@ -496,7 +490,6 @@ class VideoStreamProcessor(BaseProcessor):
     def __init__(self, model: str, token: str = "", think: bool = None):
         super().__init__(model, token)
         self.response_id: Optional[str] = None
-        self.think_opened: bool = False
         self.role_sent: bool = False
         self.video_format = str(get_config("app.video_format", "html")).lower()
 
@@ -546,19 +539,13 @@ class VideoStreamProcessor(BaseProcessor):
                 if video_resp := resp.get("streamingVideoGenerationResponse"):
                     progress = video_resp.get("progress", 0)
 
+                    # 进度信息直接输出到 content（不使用 <think> 标签）
                     if self.show_think:
-                        if not self.think_opened:
-                            yield self._sse("<think>\n")
-                            self.think_opened = True
                         yield self._sse(f"正在生成视频中，当前进度{progress}%\n")
 
                     if progress == 100:
                         video_url = video_resp.get("videoUrl", "")
                         thumbnail_url = video_resp.get("thumbnailImageUrl", "")
-
-                        if self.think_opened and self.show_think:
-                            yield self._sse("</think>\n")
-                            self.think_opened = False
 
                         if video_url:
                             final_video_url = await self.process_url(video_url, "video")
@@ -579,8 +566,6 @@ class VideoStreamProcessor(BaseProcessor):
                             logger.info(f"Video generated: {video_url}")
                     continue
 
-            if self.think_opened:
-                yield self._sse("</think>\n")
             yield self._sse(finish="stop")
             yield "data: [DONE]\n\n"
         except asyncio.CancelledError:
