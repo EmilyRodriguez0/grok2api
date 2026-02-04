@@ -150,15 +150,13 @@ class StreamProcessor(BaseProcessor):
         super().__init__(model, token)
         self.response_id: Optional[str] = None
         self.fingerprint: str = ""
+        self.think_opened: bool = False
         self.role_sent: bool = False
         self.filter_tags = get_config("grok.filter_tags", [])
         self.image_format = get_config("app.image_format", "url")
         # 用于过滤跨 token 的标签
         self._tag_buffer: str = ""
         self._in_filter_tag: bool = False
-        # 累积已输出的 content，用于检测 Grok 发送的重复内容
-        self._content_buffer: str = ""
-        self._last_token: str = ""
 
         if think is None:
             self.show_think = get_config("grok.thinking", False)
@@ -304,15 +302,6 @@ class StreamProcessor(BaseProcessor):
                     if token:
                         filtered = self._filter_token(token)
                         if filtered:
-                            # 检测 Grok 发送的重复内容（完整正文重复）
-                            # Grok 会在流结束前把正文完整重复发送一次
-                            stripped = filtered.rstrip('\n')
-                            if (len(stripped) > 10 and
-                                self._content_buffer.rstrip('\n').endswith(stripped)):
-                                # 这是重复内容，跳过
-                                continue
-                            self._content_buffer += filtered
-                            self._last_token = filtered
                             yield self._sse(filtered)
 
             # 流结束
