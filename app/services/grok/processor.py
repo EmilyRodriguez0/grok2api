@@ -357,12 +357,19 @@ class StreamProcessor(BaseProcessor):
                     if token:
                         filtered = self._filter_token(token)
                         if filtered:
-                            # 检测重复：如果新 token 包含之前所有累加的内容（思考+正文），则是重复
+                            # 检测重复：Grok API 在流末尾会发送完整重复文本
+                            # 重复文本特征：长度较长，且包含之前所有内容
                             total_accumulated = self._accumulated_reasoning + self._accumulated_content
-                            if total_accumulated and len(filtered) > len(total_accumulated) * 0.8:
-                                # 只检测长文本（避免误判短 token）
-                                if filtered.startswith(total_accumulated[:50]) or total_accumulated[:50] in filtered:
-                                    # 这是重复的完整文本，跳过（通常在流末尾出现）
+
+                            # 只检测长文本（长度 > 100 字符），避免误判正常的短 token
+                            if total_accumulated and len(filtered) > 100:
+                                # 检查累加内容是否是 filtered 的子串（说明 filtered 包含了所有之前的内容）
+                                # 或者 filtered 是否包含累加内容的大部分（相似度检测）
+                                if (total_accumulated.strip() in filtered) or (
+                                    len(total_accumulated) > 50 and
+                                    filtered.strip() in total_accumulated
+                                ):
+                                    # 这是重复的完整文本，跳过
                                     logger.debug(
                                         f"Filtered duplicate complete text (length: {len(filtered)}, accumulated: {len(total_accumulated)})",
                                         extra={"model": self.model}
