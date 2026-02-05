@@ -357,14 +357,17 @@ class StreamProcessor(BaseProcessor):
                     if token:
                         filtered = self._filter_token(token)
                         if filtered:
-                            # 检测重复：如果新 token 包含之前所有累加的内容，则是重复
-                            if self._accumulated_content and filtered.startswith(self._accumulated_content):
-                                # 这是重复的完整文本，跳过（通常在流末尾出现）
-                                logger.debug(
-                                    f"Filtered duplicate complete text (length: {len(filtered)})",
-                                    extra={"model": self.model}
-                                )
-                                continue
+                            # 检测重复：如果新 token 包含之前所有累加的内容（思考+正文），则是重复
+                            total_accumulated = self._accumulated_reasoning + self._accumulated_content
+                            if total_accumulated and len(filtered) > len(total_accumulated) * 0.8:
+                                # 只检测长文本（避免误判短 token）
+                                if filtered.startswith(total_accumulated[:50]) or total_accumulated[:50] in filtered:
+                                    # 这是重复的完整文本，跳过（通常在流末尾出现）
+                                    logger.debug(
+                                        f"Filtered duplicate complete text (length: {len(filtered)}, accumulated: {len(total_accumulated)})",
+                                        extra={"model": self.model}
+                                    )
+                                    continue
 
                             # 判断是否是思考内容
                             is_thinking = False
