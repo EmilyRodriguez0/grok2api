@@ -301,8 +301,8 @@ class GrokChatService:
         Raises:
             UpstreamException: 当 Grok API 返回错误且重试耗尽时
         """
-        if stream is None:
-            stream = get_config("grok.stream", True)
+        # stream 默认值已在 API 层处理，这里直接使用
+        stream = True if stream is True else False
 
         headers = ChatRequestBuilder.build_headers(token)
         payload = ChatRequestBuilder.build_payload(
@@ -436,11 +436,8 @@ class GrokChatService:
             finally:
                 await upload_service.close()
 
-        stream = (
-            request.stream
-            if request.stream is not None
-            else get_config("grok.stream", True)
-        )
+        # stream 默认值已在 API 层处理为 False
+        stream = True if request.stream is True else False
         think = (
             request.think
             if request.think is not None
@@ -551,7 +548,8 @@ class ChatService:
         elif thinking == "disabled":
             think = False
 
-        is_stream = stream if stream is not None else get_config("grok.stream", True)
+        # stream 默认值已在 API 层处理为 False
+        is_stream = True if stream is True else False
 
         # 构造请求
         chat_request = ChatRequest(

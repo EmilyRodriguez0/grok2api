@@ -1,6 +1,8 @@
 [grok]
 temporary = true
-stream = true
+# DEPRECATED: stream 配置已弃用，API 默认行为由请求参数控制
+# 默认非流式，只有显式传递 stream=true 才启用流式响应
+stream = false
 thinking = true
 dynamic_statsig = true
 filter_tags = ["xaiartifact","xai:tool_usage_card","grok:render"]

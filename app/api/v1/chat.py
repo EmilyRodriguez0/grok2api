@@ -120,7 +120,7 @@ class ChatCompletionRequest(BaseModel):
     def validate_stream(cls, v):
         """确保 stream 参数被正确解析为布尔值"""
         if v is None:
-            return None
+            return False
         if isinstance(v, bool):
             return v
         if isinstance(v, str):

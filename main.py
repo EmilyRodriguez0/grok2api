@@ -29,6 +29,7 @@ from app.api.v1.chat import router as chat_router  # noqa: E402
 from app.api.v1.image import router as image_router  # noqa: E402
 from app.api.v1.files import router as files_router  # noqa: E402
 from app.api.v1.models import router as models_router  # noqa: E402
+from app.api.v1.responses import router as responses_router  # noqa: E402
 from app.services.token import get_scheduler  # noqa: E402
 
 
@@ -101,6 +102,9 @@ def create_app() -> FastAPI:
     # 注册路由
     app.include_router(
         chat_router, prefix="/v1", dependencies=[Depends(verify_api_key)]
+    )
+    app.include_router(
+        responses_router, prefix="/v1", dependencies=[Depends(verify_api_key)]
     )
     app.include_router(
         image_router, prefix="/v1", dependencies=[Depends(verify_api_key)]

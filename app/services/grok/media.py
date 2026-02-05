@@ -469,7 +469,8 @@ class VideoService:
         elif thinking == "disabled":
             think = False
 
-        is_stream = stream if stream is not None else get_config("grok.stream", True)
+        # stream 默认值已在 API 层处理为 False
+        is_stream = True if stream is True else False
 
         # 提取内容
         from app.services.grok.chat import MessageExtractor
