@@ -207,11 +207,6 @@ class StreamProcessor(BaseProcessor):
         # 用于过滤跨 token 的标签
         self._tag_buffer: str = ""
         self._in_filter_tag: bool = False
-        # 用于检测重复输出
-        self._accumulated_content: str = ""
-        # 用于思考内容检测
-        self._accumulated_reasoning: str = ""
-        self._is_in_thinking_phase: bool = True  # 初始阶段默认为思考阶段
 
         if think is None:
             self.show_think = get_config("grok.thinking", False)
@@ -357,51 +352,7 @@ class StreamProcessor(BaseProcessor):
                     if token:
                         filtered = self._filter_token(token)
                         if filtered:
-                            # 检测重复：Grok API 在流末尾会发送完整重复文本
-                            # 重复文本特征：长度较长，且包含之前所有内容
-                            total_accumulated = self._accumulated_reasoning + self._accumulated_content
-
-                            # 只检测长文本（长度 > 100 字符），避免误判正常的短 token
-                            if total_accumulated and len(filtered) > 100:
-                                # 检查累加内容是否是 filtered 的子串（说明 filtered 包含了所有之前的内容）
-                                # 或者 filtered 是否包含累加内容的大部分（相似度检测）
-                                if (total_accumulated.strip() in filtered) or (
-                                    len(total_accumulated) > 50 and
-                                    filtered.strip() in total_accumulated
-                                ):
-                                    # 这是重复的完整文本，跳过
-                                    logger.debug(
-                                        f"Filtered duplicate complete text (length: {len(filtered)}, accumulated: {len(total_accumulated)})",
-                                        extra={"model": self.model}
-                                    )
-                                    continue
-
-                            # 判断是否是思考内容
-                            is_thinking = False
-                            if self.show_think and self._is_in_thinking_phase:
-                                # 检测是否是思考内容
-                                is_thinking = _is_thinking_content(
-                                    filtered,
-                                    self._accumulated_content + self._accumulated_reasoning
-                                )
-
-                            # 路由到正确的字段
-                            if is_thinking:
-                                # 思考内容 → reasoning_content
-                                self._accumulated_reasoning += filtered
-                                yield self._sse(reasoning_content=filtered)
-                            else:
-                                # 正文内容 → content
-                                # 一旦开始输出正文，标记思考阶段结束
-                                if self._is_in_thinking_phase and len(filtered.strip()) > 10:
-                                    self._is_in_thinking_phase = False
-                                    logger.debug(
-                                        f"Thinking phase ended, switching to content output",
-                                        extra={"model": self.model}
-                                    )
-
-                                self._accumulated_content += filtered
-                                yield self._sse(filtered)
+                            yield self._sse(filtered)
 
             # 流结束
             yield self._sse(finish="stop")
