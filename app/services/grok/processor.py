@@ -196,6 +196,9 @@ class StreamProcessor(BaseProcessor):
         self._emitted_text: str = ""
         self._dedupe_tail_limit: int = 8192
         self._final_token_sent: bool = False
+        self._image_generation_seen: bool = False
+        self._image_output_emitted: bool = False
+        self._pending_image_tokens: List[str] = []
 
         if think is None:
             self.show_think = get_config("grok.thinking", False)
@@ -314,6 +317,7 @@ class StreamProcessor(BaseProcessor):
 
                 # 图像生成进度
                 if img := resp.get("streamingImageGenerationResponse"):
+                    self._image_generation_seen = True
                     if self.show_think:
                         if not self.think_opened:
                             yield self._sse("<think>\n")
@@ -359,6 +363,18 @@ class StreamProcessor(BaseProcessor):
                             yield self._sse(f"![{img_id}]({final_url})\n")
                         emitted_images += 1
 
+                    if emitted_images > 0:
+                        self._image_output_emitted = True
+                        self._pending_image_tokens.clear()
+                    elif self._pending_image_tokens and not self._final_token_sent:
+                        for pending_token in self._pending_image_tokens:
+                            if self._is_replayed_token(pending_token):
+                                continue
+                            yield self._sse(pending_token)
+                            self._record_emitted_text(pending_token)
+                            self._final_token_sent = True
+                        self._pending_image_tokens.clear()
+
                     # 文本流优先使用 token 增量；若上游未提供 final token，且无图片产出时才回退 modelResponse.message
                     if not self._final_token_sent and emitted_images == 0:
                         if msg := mr.get("message"):
@@ -399,6 +415,13 @@ class StreamProcessor(BaseProcessor):
                                 yield self._sse("</think>\n")
                                 self.think_opened = False
 
+                            if (
+                                self._image_generation_seen
+                                and not self._image_output_emitted
+                            ):
+                                self._pending_image_tokens.append(filtered)
+                                continue
+
                             if self._is_replayed_token(filtered):
                                 logger.debug(
                                     "Skip replayed token chunk",
@@ -411,6 +434,19 @@ class StreamProcessor(BaseProcessor):
                             yield self._sse(filtered)
                             self._record_emitted_text(filtered)
                             self._final_token_sent = True
+
+            if (
+                self._pending_image_tokens
+                and not self._image_output_emitted
+                and not self._final_token_sent
+            ):
+                for pending_token in self._pending_image_tokens:
+                    if self._is_replayed_token(pending_token):
+                        continue
+                    yield self._sse(pending_token)
+                    self._record_emitted_text(pending_token)
+                    self._final_token_sent = True
+                self._pending_image_tokens.clear()
 
             if self.think_opened:
                 yield self._sse("</think>\n")

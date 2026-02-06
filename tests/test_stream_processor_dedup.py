@@ -401,6 +401,95 @@ async def main():
         collect_image_message_suppressed_case
     )
 
+    image_token_prompt_suppressed_case = await _collect(
+        module,
+        [
+            {
+                "result": {
+                    "response": {
+                        "streamingImageGenerationResponse": {
+                            "imageIndex": 0,
+                            "progress": 50,
+                        }
+                    }
+                }
+            },
+            {
+                "result": {
+                    "response": {
+                        "token": "I generated images with the prompt: two cute cats",
+                        "isThinking": False,
+                        "messageTag": "final",
+                    }
+                }
+            },
+            {
+                "result": {
+                    "response": {
+                        "modelResponse": {
+                            "generatedImageUrls": [
+                                "/users/test/generated/c1/image.jpg",
+                                "/users/test/generated/c2/image.jpg",
+                            ]
+                        }
+                    }
+                }
+            },
+        ],
+        app_url="https://grok.testdomain.xyz",
+    )
+    assert all(
+        "I generated images with the prompt" not in content
+        for content in image_token_prompt_suppressed_case["contents"]
+    ), image_token_prompt_suppressed_case
+    assert any(
+        "generated/c1/image.jpg" in content
+        for content in image_token_prompt_suppressed_case["contents"]
+    ), image_token_prompt_suppressed_case
+    assert any(
+        "generated/c2/image.jpg" in content
+        for content in image_token_prompt_suppressed_case["contents"]
+    ), image_token_prompt_suppressed_case
+
+    image_token_fallback_case = await _collect(
+        module,
+        [
+            {
+                "result": {
+                    "response": {
+                        "streamingImageGenerationResponse": {
+                            "imageIndex": 0,
+                            "progress": 50,
+                        }
+                    }
+                }
+            },
+            {
+                "result": {
+                    "response": {
+                        "token": "I generated images with the prompt: two cute cats",
+                        "isThinking": False,
+                        "messageTag": "final",
+                    }
+                }
+            },
+            {
+                "result": {
+                    "response": {
+                        "modelResponse": {
+                            "generatedImageUrls": [""],
+                        }
+                    }
+                }
+            },
+        ],
+        app_url="https://grok.testdomain.xyz",
+    )
+    assert any(
+        "I generated images with the prompt" in content
+        for content in image_token_fallback_case["contents"]
+    ), image_token_fallback_case
+
     long_non_suffix_case = await _collect(
         module,
         [
