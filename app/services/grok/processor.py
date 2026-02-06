@@ -124,6 +124,30 @@ class BaseProcessor:
             return rid
         return f"chatcmpl-{rid}"
 
+    @staticmethod
+    def _is_valid_generated_url(url: str) -> bool:
+        """校验上游返回的生成资源 URL 是否有效"""
+        raw = str(url or "").strip()
+        if not raw or raw == "/":
+            return False
+        if raw.startswith("http"):
+            from urllib.parse import urlparse
+
+            parsed_path = urlparse(raw).path
+            return bool(parsed_path and parsed_path != "/")
+        return True
+
+    @staticmethod
+    def _extract_image_id(url: str) -> str:
+        """从资源 URL 中提取图片 ID"""
+        raw = str(url or "").strip()
+        if raw.startswith("http"):
+            from urllib.parse import urlparse
+
+            raw = urlparse(raw).path
+        parts = [part for part in raw.split("/") if part]
+        return parts[-2] if len(parts) >= 2 else "image"
+
     def _sse(self, content: str = "", role: str = None, finish: str = None) -> str:
         """构建 SSE 响应 (StreamProcessor 通用)"""
         if not hasattr(self, "response_id"):
@@ -307,33 +331,42 @@ class StreamProcessor(BaseProcessor):
                         yield self._sse("</think>\n")
                         self.think_opened = False
 
-                    # 文本流优先使用 token 增量；若上游未提供 final token，则回退一次 modelResponse.message
-                    if not self._final_token_sent:
+                    # 处理生成的图片
+                    emitted_images = 0
+                    for url in mr.get("generatedImageUrls", []):
+                        clean_url = str(url or "").strip()
+                        if not self._is_valid_generated_url(clean_url):
+                            logger.warning(
+                                "Skip invalid generated image url",
+                                extra={"model": self.model, "url": clean_url},
+                            )
+                            continue
+
+                        img_id = self._extract_image_id(clean_url)
+
+                        if self.image_format == "base64":
+                            dl_service = self._get_dl()
+                            base64_data = await dl_service.to_base64(
+                                clean_url, self.token, "image"
+                            )
+                            if base64_data:
+                                yield self._sse(f"![{img_id}]({base64_data})\n")
+                            else:
+                                final_url = await self.process_url(clean_url, "image")
+                                yield self._sse(f"![{img_id}]({final_url})\n")
+                        else:
+                            final_url = await self.process_url(clean_url, "image")
+                            yield self._sse(f"![{img_id}]({final_url})\n")
+                        emitted_images += 1
+
+                    # 文本流优先使用 token 增量；若上游未提供 final token，且无图片产出时才回退 modelResponse.message
+                    if not self._final_token_sent and emitted_images == 0:
                         if msg := mr.get("message"):
                             filtered_msg = self._filter_token(msg)
                             if filtered_msg and not self._is_replayed_token(filtered_msg):
                                 yield self._sse(filtered_msg)
                                 self._record_emitted_text(filtered_msg)
                                 self._final_token_sent = True
-
-                    # 处理生成的图片
-                    for url in mr.get("generatedImageUrls", []):
-                        parts = url.split("/")
-                        img_id = parts[-2] if len(parts) >= 2 else "image"
-
-                        if self.image_format == "base64":
-                            dl_service = self._get_dl()
-                            base64_data = await dl_service.to_base64(
-                                url, self.token, "image"
-                            )
-                            if base64_data:
-                                yield self._sse(f"![{img_id}]({base64_data})\n")
-                            else:
-                                final_url = await self.process_url(url, "image")
-                                yield self._sse(f"![{img_id}]({final_url})\n")
-                        else:
-                            final_url = await self.process_url(url, "image")
-                            yield self._sse(f"![{img_id}]({final_url})\n")
 
                     if (
                         (meta := mr.get("metadata", {}))
@@ -477,24 +510,35 @@ class CollectProcessor(BaseProcessor):
                     content = mr.get("message", "")
 
                     if urls := mr.get("generatedImageUrls"):
-                        content += "\n"
+                        image_contents: List[str] = []
                         for url in urls:
-                            parts = url.split("/")
-                            img_id = parts[-2] if len(parts) >= 2 else "image"
+                            clean_url = str(url or "").strip()
+                            if not self._is_valid_generated_url(clean_url):
+                                logger.warning(
+                                    "Skip invalid generated image url in collect",
+                                    extra={"model": self.model, "url": clean_url},
+                                )
+                                continue
+
+                            img_id = self._extract_image_id(clean_url)
 
                             if self.image_format == "base64":
                                 dl_service = self._get_dl()
                                 base64_data = await dl_service.to_base64(
-                                    url, self.token, "image"
+                                    clean_url, self.token, "image"
                                 )
                                 if base64_data:
-                                    content += f"![{img_id}]({base64_data})\n"
+                                    image_contents.append(f"![{img_id}]({base64_data})\n")
                                 else:
-                                    final_url = await self.process_url(url, "image")
-                                    content += f"![{img_id}]({final_url})\n"
+                                    final_url = await self.process_url(clean_url, "image")
+                                    image_contents.append(f"![{img_id}]({final_url})\n")
                             else:
-                                final_url = await self.process_url(url, "image")
-                                content += f"![{img_id}]({final_url})\n"
+                                final_url = await self.process_url(clean_url, "image")
+                                image_contents.append(f"![{img_id}]({final_url})\n")
+
+                        if image_contents:
+                            # 图片结果优先，避免输出类似 "I generated images with the prompt..." 的冗余正文
+                            content = "".join(image_contents)
 
                     if (
                         (meta := mr.get("metadata", {}))
@@ -839,9 +883,17 @@ class ImageStreamProcessor(BaseProcessor):
                 if mr := resp.get("modelResponse"):
                     if urls := mr.get("generatedImageUrls"):
                         for url in urls:
+                            clean_url = str(url or "").strip()
+                            if not self._is_valid_generated_url(clean_url):
+                                logger.warning(
+                                    "Skip invalid generated image url in image stream",
+                                    extra={"model": self.model, "url": clean_url},
+                                )
+                                continue
+
                             dl_service = self._get_dl()
                             base64_data = await dl_service.to_base64(
-                                url, self.token, "image"
+                                clean_url, self.token, "image"
                             )
                             if base64_data:
                                 if "," in base64_data:
@@ -938,9 +990,17 @@ class ImageCollectProcessor(BaseProcessor):
                 if mr := resp.get("modelResponse"):
                     if urls := mr.get("generatedImageUrls"):
                         for url in urls:
+                            clean_url = str(url or "").strip()
+                            if not self._is_valid_generated_url(clean_url):
+                                logger.warning(
+                                    "Skip invalid generated image url in image collect",
+                                    extra={"model": self.model, "url": clean_url},
+                                )
+                                continue
+
                             dl_service = self._get_dl()
                             base64_data = await dl_service.to_base64(
-                                url, self.token, "image"
+                                clean_url, self.token, "image"
                             )
                             if base64_data:
                                 if "," in base64_data:

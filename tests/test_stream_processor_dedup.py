@@ -111,12 +111,21 @@ def _parse_sse_output(lines):
     }
 
 
-async def _collect(module, events, think=True):
+async def _collect(module, events, think=True, app_url=None):
     processor = module.StreamProcessor("grok-4.1-thinking", "", think=think)
+    if app_url is not None:
+        processor.app_url = app_url
     lines = []
     async for item in processor.process(_make_stream(events)):
         lines.append(item)
     return _parse_sse_output(lines)
+
+
+async def _collect_non_stream(module, events, app_url=None):
+    processor = module.CollectProcessor("grok-4.1-thinking", "")
+    if app_url is not None:
+        processor.app_url = app_url
+    return await processor.process(_make_stream(events))
 
 
 async def main():
@@ -274,6 +283,122 @@ async def main():
     )
     assert model_response_no_duplicate_case["contents"] == ["你", "好"], (
         model_response_no_duplicate_case
+    )
+
+    empty_first_image_case = await _collect(
+        module,
+        [
+            {
+                "result": {
+                    "response": {
+                        "modelResponse": {
+                            "generatedImageUrls": [
+                                "",
+                                "/users/test/generated/real-image-id/image.jpg",
+                            ]
+                        }
+                    }
+                }
+            }
+        ],
+        app_url="https://grok.testdomain.xyz",
+    )
+    assert any(
+        "real-image-id/image.jpg" in content
+        for content in empty_first_image_case["contents"]
+    ), empty_first_image_case
+    assert all(
+        "v1/files/image/)" not in content
+        for content in empty_first_image_case["contents"]
+    ), empty_first_image_case
+
+    collect_empty_image_case = await _collect_non_stream(
+        module,
+        [
+            {
+                "result": {
+                    "response": {
+                        "modelResponse": {
+                            "responseId": "rid",
+                            "message": "done",
+                            "generatedImageUrls": [
+                                "",
+                                "/users/test/generated/collect-image-id/image.jpg",
+                            ],
+                        }
+                    }
+                }
+            }
+        ],
+        app_url="https://grok.testdomain.xyz",
+    )
+    collect_content = collect_empty_image_case["choices"][0]["message"]["content"]
+    assert "collect-image-id/image.jpg" in collect_content, collect_empty_image_case
+    assert "v1/files/image/)" not in collect_content, collect_empty_image_case
+
+    image_message_suppressed_case = await _collect(
+        module,
+        [
+            {
+                "result": {
+                    "response": {
+                        "modelResponse": {
+                            "message": "I generated images with the prompt: cute kitten",
+                            "generatedImageUrls": [
+                                "/users/test/generated/a1/image.jpg",
+                                "/users/test/generated/a2/image.jpg",
+                            ],
+                        }
+                    }
+                }
+            }
+        ],
+        app_url="https://grok.testdomain.xyz",
+    )
+    assert all(
+        "I generated images with the prompt" not in content
+        for content in image_message_suppressed_case["contents"]
+    ), image_message_suppressed_case
+    assert any(
+        "generated/a1/image.jpg" in content
+        for content in image_message_suppressed_case["contents"]
+    ), image_message_suppressed_case
+    assert any(
+        "generated/a2/image.jpg" in content
+        for content in image_message_suppressed_case["contents"]
+    ), image_message_suppressed_case
+
+    collect_image_message_suppressed_case = await _collect_non_stream(
+        module,
+        [
+            {
+                "result": {
+                    "response": {
+                        "modelResponse": {
+                            "responseId": "rid2",
+                            "message": "I generated images with the prompt: cute kitten",
+                            "generatedImageUrls": [
+                                "/users/test/generated/b1/image.jpg",
+                                "/users/test/generated/b2/image.jpg",
+                            ],
+                        }
+                    }
+                }
+            }
+        ],
+        app_url="https://grok.testdomain.xyz",
+    )
+    collect_image_content = collect_image_message_suppressed_case["choices"][0][
+        "message"
+    ]["content"]
+    assert "I generated images with the prompt" not in collect_image_content, (
+        collect_image_message_suppressed_case
+    )
+    assert "generated/b1/image.jpg" in collect_image_content, (
+        collect_image_message_suppressed_case
+    )
+    assert "generated/b2/image.jpg" in collect_image_content, (
+        collect_image_message_suppressed_case
     )
 
     long_non_suffix_case = await _collect(
