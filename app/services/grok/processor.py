@@ -14,7 +14,7 @@ from curl_cffi.requests.errors import RequestsError
 from app.core.config import get_config
 from app.core.logger import logger
 from app.core.exceptions import UpstreamException
-from app.services.grok.assets import DownloadService
+from app.services.grok.services.assets import DownloadService
 
 
 def _is_http2_stream_error(e: Exception) -> bool:
@@ -74,47 +74,6 @@ async def _with_idle_timeout(
 ASSET_URL = "https://assets.grok.com/"
 
 
-def _is_thinking_content(text: str, accumulated: str = "") -> bool:
-    """
-    判断是否是思考内容
-
-    Args:
-        text: 当前 token 文本
-        accumulated: 已累加的完整文本（用于上下文判断）
-
-    Returns:
-        bool: 是否是思考内容
-    """
-    # 思考内容的特征模式
-    thinking_patterns = [
-        "Thinking about",
-        "Let me think",
-        "我需要思考",
-        "让我想想",
-        "分析一下",
-        "考虑以下",
-    ]
-
-    # 思考内容通常在开头出现
-    # 如果已经有累加内容，且当前内容很短，可能是思考的一部分
-    if accumulated:
-        # 如果累加内容少于100字符，且当前token很短（<20字符），可能还在思考阶段
-        if len(accumulated) < 100 and len(text.strip()) < 20:
-            # 检查是否包含思考关键词或者是短语片段
-            if any(pattern in accumulated for pattern in thinking_patterns):
-                return True
-            # 检查是否是典型的思考短语片段
-            if text.strip() in ["我是", "身份", "确认", "分析", "思考"]:
-                return True
-
-    # 检查当前文本是否包含思考模式
-    for pattern in thinking_patterns:
-        if pattern in text:
-            return True
-
-    return False
-
-
 class BaseProcessor:
     """基础处理器"""
 
@@ -155,13 +114,7 @@ class BaseProcessor:
         else:
             return f"{ASSET_URL.rstrip('/')}{path}"
 
-    def _sse(
-        self,
-        content: str = "",
-        role: str = None,
-        finish: str = None,
-        reasoning_content: str = None,
-    ) -> str:
+    def _sse(self, content: str = "", role: str = None, finish: str = None) -> str:
         """构建 SSE 响应 (StreamProcessor 通用)"""
         if not hasattr(self, "response_id"):
             self.response_id = None
@@ -174,10 +127,6 @@ class BaseProcessor:
             delta["content"] = ""
         elif content:
             delta["content"] = content
-
-        # 添加 reasoning_content 支持（OpenAI 标准）
-        if reasoning_content:
-            delta["reasoning_content"] = reasoning_content
 
         chunk = {
             "id": self.response_id or f"chatcmpl-{uuid.uuid4().hex[:24]}",
@@ -201,6 +150,7 @@ class StreamProcessor(BaseProcessor):
         super().__init__(model, token)
         self.response_id: Optional[str] = None
         self.fingerprint: str = ""
+        self.think_opened: bool = False
         self.role_sent: bool = False
         self.filter_tags = get_config("grok.filter_tags", [])
         self.image_format = get_config("app.image_format", "url")
@@ -305,8 +255,10 @@ class StreamProcessor(BaseProcessor):
 
                 # 图像生成进度
                 if img := resp.get("streamingImageGenerationResponse"):
-                    # 进度信息直接输出到 content（不使用 <think> 标签）
                     if self.show_think:
+                        if not self.think_opened:
+                            yield self._sse("<think>\n")
+                            self.think_opened = True
                         idx = img.get("imageIndex", 0) + 1
                         progress = img.get("progress", 0)
                         yield self._sse(
@@ -316,9 +268,11 @@ class StreamProcessor(BaseProcessor):
 
                 # modelResponse
                 if mr := resp.get("modelResponse"):
-                    # 输出 message（如果有）
-                    if self.show_think and (msg := mr.get("message")):
-                        yield self._sse(msg + "\n")
+                    if self.think_opened and self.show_think:
+                        if msg := mr.get("message"):
+                            yield self._sse(msg + "\n")
+                        yield self._sse("</think>\n")
+                        self.think_opened = False
 
                     # 处理生成的图片
                     for url in mr.get("generatedImageUrls", []):
@@ -354,7 +308,8 @@ class StreamProcessor(BaseProcessor):
                         if filtered:
                             yield self._sse(filtered)
 
-            # 流结束
+            if self.think_opened:
+                yield self._sse("</think>\n")
             yield self._sse(finish="stop")
             yield "data: [DONE]\n\n"
         except asyncio.CancelledError:
@@ -541,6 +496,7 @@ class VideoStreamProcessor(BaseProcessor):
     def __init__(self, model: str, token: str = "", think: bool = None):
         super().__init__(model, token)
         self.response_id: Optional[str] = None
+        self.think_opened: bool = False
         self.role_sent: bool = False
         self.video_format = str(get_config("app.video_format", "html")).lower()
 
@@ -590,13 +546,19 @@ class VideoStreamProcessor(BaseProcessor):
                 if video_resp := resp.get("streamingVideoGenerationResponse"):
                     progress = video_resp.get("progress", 0)
 
-                    # 进度信息直接输出到 content（不使用 <think> 标签）
                     if self.show_think:
+                        if not self.think_opened:
+                            yield self._sse("<think>\n")
+                            self.think_opened = True
                         yield self._sse(f"正在生成视频中，当前进度{progress}%\n")
 
                     if progress == 100:
                         video_url = video_resp.get("videoUrl", "")
                         thumbnail_url = video_resp.get("thumbnailImageUrl", "")
+
+                        if self.think_opened and self.show_think:
+                            yield self._sse("</think>\n")
+                            self.think_opened = False
 
                         if video_url:
                             final_video_url = await self.process_url(video_url, "video")
@@ -617,6 +579,8 @@ class VideoStreamProcessor(BaseProcessor):
                             logger.info(f"Video generated: {video_url}")
                     continue
 
+            if self.think_opened:
+                yield self._sse("</think>\n")
             yield self._sse(finish="stop")
             yield "data: [DONE]\n\n"
         except asyncio.CancelledError:
