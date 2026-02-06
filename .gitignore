@@ -30,6 +30,7 @@ env/
 # IDE
 .vscode/
 .idea/
+.ace-tool/
 *.swp
 *.swo
 *~
