@@ -35,7 +35,7 @@ class ChatRequest:
 
     model: str
     messages: List[Dict[str, Any]]
-    stream: bool = None
+    stream: bool = False
     think: bool = None
 
 
@@ -277,7 +277,7 @@ class GrokChatService:
         message: str,
         model: str = "grok-3",
         mode: str = None,
-        stream: bool = None,
+        stream: bool = False,
         think: bool = None,
         file_attachments: List[str] = None,
         image_attachments: List[str] = None,
@@ -298,9 +298,6 @@ class GrokChatService:
         Raises:
             UpstreamException: 当 Grok API 返回错误且重试耗尽时
         """
-        if stream is None:
-            stream = get_config("grok.stream", True)
-
         headers = ChatRequestBuilder.build_headers(token)
         payload = ChatRequestBuilder.build_payload(
             message, model, mode, think, file_attachments, image_attachments
@@ -451,11 +448,7 @@ class GrokChatService:
             finally:
                 await upload_service.close()
 
-        stream = (
-            request.stream
-            if request.stream is not None
-            else get_config("grok.stream", True)
-        )
+        stream = True if request.stream is True else False
 
         response = await self.chat(
             token,
@@ -514,7 +507,7 @@ class ChatService:
     async def completions(
         model: str,
         messages: List[Dict[str, Any]],
-        stream: bool = None,
+        stream: bool = False,
         thinking: str = None,
     ):
         """
@@ -561,7 +554,7 @@ class ChatService:
         elif thinking == "disabled":
             think = False
 
-        is_stream = stream if stream is not None else get_config("grok.stream", True)
+        is_stream = True if stream is True else False
 
         # 构造请求
         chat_request = ChatRequest(

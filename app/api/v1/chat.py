@@ -109,7 +109,7 @@ class ChatCompletionRequest(BaseModel):
 
     model: str = Field(..., description="模型名称")
     messages: List[MessageItem] = Field(..., description="消息数组")
-    stream: Optional[bool] = Field(None, description="是否流式输出")
+    stream: bool = Field(False, description="是否流式输出")
     thinking: Optional[str] = Field(None, description="思考模式: enabled/disabled/None")
 
     # 视频生成配置
@@ -120,7 +120,7 @@ class ChatCompletionRequest(BaseModel):
     def validate_stream(cls, v):
         """确保 stream 参数被正确解析为布尔值"""
         if v is None:
-            return None
+            return False
         if isinstance(v, bool):
             return v
         if isinstance(v, str):
