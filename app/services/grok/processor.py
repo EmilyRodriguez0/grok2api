@@ -14,7 +14,7 @@ from curl_cffi.requests.errors import RequestsError
 from app.core.config import get_config
 from app.core.logger import logger
 from app.core.exceptions import UpstreamException
-from app.services.grok.services.assets import DownloadService
+from app.services.grok.assets import DownloadService
 
 
 def _is_http2_stream_error(e: Exception) -> bool:
@@ -114,12 +114,24 @@ class BaseProcessor:
         else:
             return f"{ASSET_URL.rstrip('/')}{path}"
 
+    @staticmethod
+    def _normalize_chatcmpl_id(raw_id: str = "") -> str:
+        """标准化 OpenAI Chat Completion ID 格式"""
+        rid = str(raw_id or "").strip()
+        if not rid:
+            return f"chatcmpl-{uuid.uuid4().hex[:24]}"
+        if rid.startswith("chatcmpl-"):
+            return rid
+        return f"chatcmpl-{rid}"
+
     def _sse(self, content: str = "", role: str = None, finish: str = None) -> str:
         """构建 SSE 响应 (StreamProcessor 通用)"""
         if not hasattr(self, "response_id"):
             self.response_id = None
         if not hasattr(self, "fingerprint"):
             self.fingerprint = ""
+        if not self.response_id:
+            self.response_id = self._normalize_chatcmpl_id()
 
         delta = {}
         if role:
@@ -129,7 +141,7 @@ class BaseProcessor:
             delta["content"] = content
 
         chunk = {
-            "id": self.response_id or f"chatcmpl-{uuid.uuid4().hex[:24]}",
+            "id": self.response_id,
             "object": "chat.completion.chunk",
             "created": self.created,
             "model": self.model,
@@ -157,6 +169,9 @@ class StreamProcessor(BaseProcessor):
         # 用于过滤跨 token 的标签
         self._tag_buffer: str = ""
         self._in_filter_tag: bool = False
+        self._emitted_text: str = ""
+        self._dedupe_tail_limit: int = 8192
+        self._final_token_sent: bool = False
 
         if think is None:
             self.show_think = get_config("grok.thinking", False)
@@ -224,6 +239,25 @@ class StreamProcessor(BaseProcessor):
 
         return "".join(result)
 
+    def _is_replayed_token(self, token: str) -> bool:
+        """检测上游回放的整段 token，避免末尾重复输出"""
+        if not token or not self._emitted_text:
+            return False
+
+        normalized = token.rstrip("\r\n")
+        if len(normalized) < 12:
+            return False
+
+        return self._emitted_text.rstrip("\r\n").endswith(normalized)
+
+    def _record_emitted_text(self, text: str) -> None:
+        """记录已输出正文，用于回放去重"""
+        if not text:
+            return
+        self._emitted_text += text
+        if len(self._emitted_text) > self._dedupe_tail_limit:
+            self._emitted_text = self._emitted_text[-self._dedupe_tail_limit :]
+
     async def process(
         self, response: AsyncIterable[bytes]
     ) -> AsyncGenerator[str, None]:
@@ -246,7 +280,8 @@ class StreamProcessor(BaseProcessor):
                 if (llm := resp.get("llmInfo")) and not self.fingerprint:
                     self.fingerprint = llm.get("modelHash", "")
                 if rid := resp.get("responseId"):
-                    self.response_id = rid
+                    if not self.role_sent:
+                        self.response_id = self._normalize_chatcmpl_id(rid)
 
                 # 首次发送 role
                 if not self.role_sent:
@@ -269,10 +304,17 @@ class StreamProcessor(BaseProcessor):
                 # modelResponse
                 if mr := resp.get("modelResponse"):
                     if self.think_opened and self.show_think:
-                        if msg := mr.get("message"):
-                            yield self._sse(msg + "\n")
                         yield self._sse("</think>\n")
                         self.think_opened = False
+
+                    # 文本流优先使用 token 增量；若上游未提供 final token，则回退一次 modelResponse.message
+                    if not self._final_token_sent:
+                        if msg := mr.get("message"):
+                            filtered_msg = self._filter_token(msg)
+                            if filtered_msg and not self._is_replayed_token(filtered_msg):
+                                yield self._sse(filtered_msg)
+                                self._record_emitted_text(filtered_msg)
+                                self._final_token_sent = True
 
                     # 处理生成的图片
                     for url in mr.get("generatedImageUrls", []):
@@ -304,9 +346,38 @@ class StreamProcessor(BaseProcessor):
                 # 普通 token
                 if (token := resp.get("token")) is not None:
                     if token:
+                        message_tag = str(resp.get("messageTag", "")).lower()
+                        is_reasoning = bool(resp.get("isThinking")) or message_tag in {
+                            "header",
+                            "summary",
+                        }
+
                         filtered = self._filter_token(token)
                         if filtered:
+                            if is_reasoning:
+                                if self.show_think:
+                                    if not self.think_opened:
+                                        yield self._sse("<think>\n")
+                                        self.think_opened = True
+                                    yield self._sse(filtered)
+                                continue
+
+                            if self.think_opened and self.show_think:
+                                yield self._sse("</think>\n")
+                                self.think_opened = False
+
+                            if self._is_replayed_token(filtered):
+                                logger.debug(
+                                    "Skip replayed token chunk",
+                                    extra={
+                                        "model": self.model,
+                                        "token_preview": filtered[:80],
+                                    },
+                                )
+                                continue
                             yield self._sse(filtered)
+                            self._record_emitted_text(filtered)
+                            self._final_token_sent = True
 
             if self.think_opened:
                 yield self._sse("</think>\n")
@@ -400,7 +471,9 @@ class CollectProcessor(BaseProcessor):
                     fingerprint = llm.get("modelHash", "")
 
                 if mr := resp.get("modelResponse"):
-                    response_id = mr.get("responseId", "")
+                    response_id = self._normalize_chatcmpl_id(
+                        mr.get("responseId", response_id)
+                    )
                     content = mr.get("message", "")
 
                     if urls := mr.get("generatedImageUrls"):
@@ -454,7 +527,7 @@ class CollectProcessor(BaseProcessor):
         content = self._filter_content(content)
 
         return {
-            "id": response_id,
+            "id": self._normalize_chatcmpl_id(response_id),
             "object": "chat.completion",
             "created": self.created,
             "model": self.model,
@@ -466,27 +539,11 @@ class CollectProcessor(BaseProcessor):
                         "role": "assistant",
                         "content": content,
                         "refusal": None,
-                        "annotations": [],
                     },
                     "finish_reason": "stop",
                 }
             ],
-            "usage": {
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "total_tokens": 0,
-                "prompt_tokens_details": {
-                    "cached_tokens": 0,
-                    "text_tokens": 0,
-                    "audio_tokens": 0,
-                    "image_tokens": 0,
-                },
-                "completion_tokens_details": {
-                    "text_tokens": 0,
-                    "audio_tokens": 0,
-                    "reasoning_tokens": 0,
-                },
-            },
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         }
 
 
@@ -535,7 +592,7 @@ class VideoStreamProcessor(BaseProcessor):
                 resp = data.get("result", {}).get("response", {})
 
                 if rid := resp.get("responseId"):
-                    self.response_id = rid
+                    self.response_id = self._normalize_chatcmpl_id(rid)
 
                 # 首次发送 role
                 if not self.role_sent:
@@ -657,7 +714,9 @@ class VideoCollectProcessor(BaseProcessor):
 
                 if video_resp := resp.get("streamingVideoGenerationResponse"):
                     if video_resp.get("progress") == 100:
-                        response_id = resp.get("responseId", "")
+                        response_id = self._normalize_chatcmpl_id(
+                            resp.get("responseId", response_id)
+                        )
                         video_url = video_resp.get("videoUrl", "")
                         thumbnail_url = video_resp.get("thumbnailImageUrl", "")
 
@@ -704,7 +763,7 @@ class VideoCollectProcessor(BaseProcessor):
             await self.close()
 
         return {
-            "id": response_id,
+            "id": self._normalize_chatcmpl_id(response_id),
             "object": "chat.completion",
             "created": self.created,
             "model": self.model,

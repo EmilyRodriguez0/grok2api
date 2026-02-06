@@ -244,7 +244,7 @@ class ChatRequestBuilder:
             "toolOverrides": {},
             "enableSideBySide": True,
             "sendFinalMetadata": True,
-            "isReasoning": False,
+            "isReasoning": bool(think),
             "disableTextFollowUps": False,
             "responseMetadata": {
                 "modelConfigOverride": {"modelMap": {}},
