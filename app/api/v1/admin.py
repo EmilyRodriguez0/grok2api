@@ -1,15 +1,19 @@
 from fastapi import APIRouter, Depends, HTTPException, Request, Query
 from fastapi.responses import HTMLResponse, StreamingResponse
+from pydantic import BaseModel
 from app.core.auth import verify_api_key, verify_app_key, get_admin_api_key
 from app.core.config import config, get_config
 from app.core.batch_tasks import create_task, get_task, expire_task
 from app.core.storage import get_storage, LocalStorage, RedisStorage, SQLStorage
+from app.core.exceptions import AppException
 import os
 from pathlib import Path
 import aiofiles
 import asyncio
 import orjson
 from app.core.logger import logger
+from app.services.grok.services.voice import VoiceService
+from app.services.token import get_token_manager
 
 
 router = APIRouter()
@@ -107,6 +111,77 @@ async def admin_token_page():
     return await render_template("token/token.html")
 
 
+@router.get("/admin/voice", response_class=HTMLResponse, include_in_schema=False)
+async def admin_voice_page():
+    """Voice Live 调试页"""
+    return await render_template("voice/voice.html")
+
+
+class VoiceTokenResponse(BaseModel):
+    token: str
+    url: str
+    participant_name: str = ""
+    room_name: str = ""
+
+
+@router.get(
+    "/api/v1/admin/voice/token",
+    dependencies=[Depends(verify_api_key)],
+    response_model=VoiceTokenResponse,
+)
+async def admin_voice_token(
+    voice: str = "ara",
+    personality: str = "assistant",
+    speed: float = 1.0,
+):
+    """获取 Grok Voice Mode (LiveKit) Token"""
+    token_mgr = await get_token_manager()
+    sso_token = None
+    for pool_name in ("ssoBasic", "ssoSuper"):
+        sso_token = token_mgr.get_token(pool_name)
+        if sso_token:
+            break
+
+    if not sso_token:
+        raise AppException(
+            "No available tokens for voice mode",
+            code="no_token",
+            status_code=503,
+        )
+
+    service = VoiceService()
+    try:
+        data = await service.get_token(
+            token=sso_token,
+            voice=voice,
+            personality=personality,
+            speed=speed,
+        )
+        token = data.get("token")
+        if not token:
+            raise AppException(
+                "Upstream returned no voice token",
+                code="upstream_error",
+                status_code=502,
+            )
+
+        return VoiceTokenResponse(
+            token=token,
+            url="wss://livekit.grok.com",
+            participant_name="",
+            room_name="",
+        )
+
+    except Exception as e:
+        if isinstance(e, AppException):
+            raise
+        raise AppException(
+            f"Voice token error: {str(e)}",
+            code="voice_error",
+            status_code=500,
+        )
+
+
 @router.post("/api/v1/admin/login", dependencies=[Depends(verify_app_key)])
 async def admin_login_api():
     """管理后台登录验证（使用 app_key）"""
@@ -167,9 +242,63 @@ async def update_tokens_api(data: dict):
     storage = get_storage()
     try:
         from app.services.token.manager import get_token_manager
+        from app.services.token.models import TokenInfo
 
         async with storage.acquire_lock("tokens_save", timeout=10):
-            await storage.save_tokens(data)
+            existing = await storage.load_tokens() or {}
+            normalized = {}
+            allowed_fields = set(TokenInfo.model_fields.keys())
+            existing_map = {}
+            for pool_name, tokens in existing.items():
+                if not isinstance(tokens, list):
+                    continue
+                pool_map = {}
+                for item in tokens:
+                    if isinstance(item, str):
+                        token_data = {"token": item}
+                    elif isinstance(item, dict):
+                        token_data = dict(item)
+                    else:
+                        continue
+                    raw_token = token_data.get("token")
+                    if isinstance(raw_token, str) and raw_token.startswith("sso="):
+                        token_data["token"] = raw_token[4:]
+                    token_key = token_data.get("token")
+                    if isinstance(token_key, str):
+                        pool_map[token_key] = token_data
+                existing_map[pool_name] = pool_map
+            for pool_name, tokens in (data or {}).items():
+                if not isinstance(tokens, list):
+                    continue
+                pool_list = []
+                for item in tokens:
+                    if isinstance(item, str):
+                        token_data = {"token": item}
+                    elif isinstance(item, dict):
+                        token_data = dict(item)
+                    else:
+                        continue
+
+                    raw_token = token_data.get("token")
+                    if isinstance(raw_token, str) and raw_token.startswith("sso="):
+                        token_data["token"] = raw_token[4:]
+
+                    base = existing_map.get(pool_name, {}).get(token_data.get("token"), {})
+                    merged = dict(base)
+                    merged.update(token_data)
+                    if merged.get("tags") is None:
+                        merged["tags"] = []
+
+                    filtered = {k: v for k, v in merged.items() if k in allowed_fields}
+                    try:
+                        info = TokenInfo(**filtered)
+                        pool_list.append(info.model_dump())
+                    except Exception as e:
+                        logger.warning(f"Skip invalid token in pool '{pool_name}': {e}")
+                        continue
+                normalized[pool_name] = pool_list
+
+            await storage.save_tokens(normalized)
             mgr = await get_token_manager()
             await mgr.reload()
         return {"status": "success", "message": "Token 已更新"}
@@ -181,7 +310,7 @@ async def update_tokens_api(data: dict):
 async def refresh_tokens_api(data: dict):
     """刷新 Token 状态"""
     from app.services.token.manager import get_token_manager
-    from app.services.grok.batch import run_in_batches
+    from app.services.grok.utils.batch import run_in_batches
 
     try:
         mgr = await get_token_manager()
@@ -252,7 +381,7 @@ async def refresh_tokens_api(data: dict):
 async def refresh_tokens_api_async(data: dict):
     """刷新 Token 状态（异步批量 + SSE 进度）"""
     from app.services.token.manager import get_token_manager
-    from app.services.grok.batch import run_in_batches
+    from app.services.grok.utils.batch import run_in_batches
 
     mgr = await get_token_manager()
     tokens: list[str] = []
@@ -355,8 +484,8 @@ async def refresh_tokens_api_async(data: dict):
 @router.post("/api/v1/admin/tokens/nsfw/enable", dependencies=[Depends(verify_api_key)])
 async def enable_nsfw_api(data: dict):
     """批量开启 NSFW (Unhinged) 模式"""
-    from app.services.grok.nsfw import NSFWService
-    from app.services.grok.batch import run_in_batches
+    from app.services.grok.services.nsfw import NSFWService
+    from app.services.grok.utils.batch import run_in_batches
     from app.services.token.manager import get_token_manager
 
     try:
@@ -468,8 +597,8 @@ async def enable_nsfw_api(data: dict):
 )
 async def enable_nsfw_api_async(data: dict):
     """批量开启 NSFW (Unhinged) 模式（异步批量 + SSE 进度）"""
-    from app.services.grok.nsfw import NSFWService
-    from app.services.grok.batch import run_in_batches
+    from app.services.grok.services.nsfw import NSFWService
+    from app.services.grok.utils.batch import run_in_batches
     from app.services.token.manager import get_token_manager
 
     mgr = await get_token_manager()
@@ -587,6 +716,226 @@ async def enable_nsfw_api_async(data: dict):
     }
 
 
+@router.post("/api/v1/admin/tokens/nsfw/disable", dependencies=[Depends(verify_api_key)])
+async def disable_nsfw_api(data: dict):
+    """批量关闭 NSFW (Unhinged) 模式"""
+    from app.services.grok.services.nsfw import NSFWService
+    from app.services.grok.utils.batch import run_in_batches
+    from app.services.token.manager import get_token_manager
+
+    try:
+        mgr = await get_token_manager()
+        nsfw_service = NSFWService()
+
+        tokens: list[str] = []
+        if isinstance(data.get("token"), str) and data["token"].strip():
+            tokens.append(data["token"].strip())
+        if isinstance(data.get("tokens"), list):
+            tokens.extend([str(t).strip() for t in data["tokens"] if str(t).strip()])
+
+        if not tokens:
+            for pool in mgr.pools.values():
+                for info in pool.list():
+                    raw = info.token[4:] if info.token.startswith("sso=") else info.token
+                    tokens.append(raw)
+
+        if not tokens:
+            raise HTTPException(status_code=400, detail="No tokens available")
+
+        unique_tokens = list(dict.fromkeys(tokens))
+
+        max_tokens = get_config("performance.nsfw_max_tokens", 1000)
+        try:
+            max_tokens = int(max_tokens)
+        except Exception:
+            max_tokens = 1000
+
+        truncated = False
+        original_count = len(unique_tokens)
+        if len(unique_tokens) > max_tokens:
+            unique_tokens = unique_tokens[:max_tokens]
+            truncated = True
+            logger.warning(
+                f"NSFW disable: truncated from {original_count} to {max_tokens} tokens"
+            )
+
+        max_concurrent = get_config("performance.nsfw_max_concurrent", 10)
+        batch_size = get_config("performance.nsfw_batch_size", 50)
+
+        async def _disable(token: str):
+            result = await nsfw_service.disable(token)
+            if result.success:
+                await mgr.remove_tag(token, "nsfw")
+            return {
+                "success": result.success,
+                "http_status": result.http_status,
+                "grpc_status": result.grpc_status,
+                "grpc_message": result.grpc_message,
+                "error": result.error,
+            }
+
+        raw_results = await run_in_batches(
+            unique_tokens, _disable, max_concurrent=max_concurrent, batch_size=batch_size
+        )
+
+        results = {}
+        ok_count = 0
+        fail_count = 0
+        for token, res in raw_results.items():
+            masked = f"{token[:8]}...{token[-8:]}" if len(token) > 20 else token
+            if res.get("ok") and res.get("data", {}).get("success"):
+                ok_count += 1
+                results[masked] = res.get("data", {})
+            else:
+                fail_count += 1
+                results[masked] = res.get("data") or {"error": res.get("error")}
+
+        response = {
+            "status": "success",
+            "summary": {
+                "total": len(unique_tokens),
+                "ok": ok_count,
+                "fail": fail_count,
+            },
+            "results": results,
+        }
+        if truncated:
+            response["warning"] = (
+                f"数量超出限制，仅处理前 {max_tokens} 个（共 {original_count} 个）"
+            )
+        return response
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Disable NSFW failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post(
+    "/api/v1/admin/tokens/nsfw/disable/async", dependencies=[Depends(verify_api_key)]
+)
+async def disable_nsfw_api_async(data: dict):
+    """批量关闭 NSFW (Unhinged) 模式（异步批量 + SSE 进度）"""
+    from app.services.grok.services.nsfw import NSFWService
+    from app.services.grok.utils.batch import run_in_batches
+    from app.services.token.manager import get_token_manager
+
+    mgr = await get_token_manager()
+    nsfw_service = NSFWService()
+
+    tokens: list[str] = []
+    if isinstance(data.get("token"), str) and data["token"].strip():
+        tokens.append(data["token"].strip())
+    if isinstance(data.get("tokens"), list):
+        tokens.extend([str(t).strip() for t in data["tokens"] if str(t).strip()])
+
+    if not tokens:
+        for pool in mgr.pools.values():
+            for info in pool.list():
+                raw = info.token[4:] if info.token.startswith("sso=") else info.token
+                tokens.append(raw)
+
+    if not tokens:
+        raise HTTPException(status_code=400, detail="No tokens available")
+
+    unique_tokens = list(dict.fromkeys(tokens))
+
+    max_tokens = get_config("performance.nsfw_max_tokens", 1000)
+    try:
+        max_tokens = int(max_tokens)
+    except Exception:
+        max_tokens = 1000
+
+    truncated = False
+    original_count = len(unique_tokens)
+    if len(unique_tokens) > max_tokens:
+        unique_tokens = unique_tokens[:max_tokens]
+        truncated = True
+        logger.warning(
+            f"NSFW disable: truncated from {original_count} to {max_tokens} tokens"
+        )
+
+    max_concurrent = get_config("performance.nsfw_max_concurrent", 10)
+    batch_size = get_config("performance.nsfw_batch_size", 50)
+
+    task = create_task(len(unique_tokens))
+
+    async def _run():
+        try:
+
+            async def _disable(token: str):
+                result = await nsfw_service.disable(token)
+                if result.success:
+                    await mgr.remove_tag(token, "nsfw")
+                return {
+                    "success": result.success,
+                    "http_status": result.http_status,
+                    "grpc_status": result.grpc_status,
+                    "grpc_message": result.grpc_message,
+                    "error": result.error,
+                }
+
+            async def _on_item(item: str, res: dict):
+                ok = bool(res.get("ok") and res.get("data", {}).get("success"))
+                task.record(ok)
+
+            raw_results = await run_in_batches(
+                unique_tokens,
+                _disable,
+                max_concurrent=max_concurrent,
+                batch_size=batch_size,
+                on_item=_on_item,
+                should_cancel=lambda: task.cancelled,
+            )
+
+            if task.cancelled:
+                task.finish_cancelled()
+                return
+
+            results = {}
+            ok_count = 0
+            fail_count = 0
+            for token, res in raw_results.items():
+                masked = f"{token[:8]}...{token[-8:]}" if len(token) > 20 else token
+                if res.get("ok") and res.get("data", {}).get("success"):
+                    ok_count += 1
+                    results[masked] = res.get("data", {})
+                else:
+                    fail_count += 1
+                    results[masked] = res.get("data") or {"error": res.get("error")}
+
+            await mgr._save()
+
+            result = {
+                "status": "success",
+                "summary": {
+                    "total": len(unique_tokens),
+                    "ok": ok_count,
+                    "fail": fail_count,
+                },
+                "results": results,
+            }
+            warning = None
+            if truncated:
+                warning = (
+                    f"数量超出限制，仅处理前 {max_tokens} 个（共 {original_count} 个）"
+                )
+            task.finish(result, warning=warning)
+        except Exception as e:
+            task.fail_task(str(e))
+        finally:
+            asyncio.create_task(expire_task(task.id, 300))
+
+    asyncio.create_task(_run())
+
+    return {
+        "status": "success",
+        "task_id": task.id,
+        "total": len(unique_tokens),
+    }
+
+
 @router.get("/admin/cache", response_class=HTMLResponse, include_in_schema=False)
 async def admin_cache_page():
     """缓存管理页"""
@@ -596,9 +945,9 @@ async def admin_cache_page():
 @router.get("/api/v1/admin/cache", dependencies=[Depends(verify_api_key)])
 async def get_cache_stats_api(request: Request):
     """获取缓存统计"""
-    from app.services.grok.assets import DownloadService, ListService
+    from app.services.grok.services.assets import DownloadService, ListService
     from app.services.token.manager import get_token_manager
-    from app.services.grok.batch import run_in_batches
+    from app.services.grok.utils.batch import run_in_batches
 
     try:
         dl_service = DownloadService()
@@ -833,9 +1182,9 @@ async def get_cache_stats_api(request: Request):
 )
 async def load_online_cache_api_async(data: dict):
     """在线资产统计（异步批量 + SSE 进度）"""
-    from app.services.grok.assets import DownloadService, ListService
+    from app.services.grok.services.assets import DownloadService, ListService
     from app.services.token.manager import get_token_manager
-    from app.services.grok.batch import run_in_batches
+    from app.services.grok.utils.batch import run_in_batches
 
     mgr = await get_token_manager()
 
@@ -993,7 +1342,7 @@ async def load_online_cache_api_async(data: dict):
 @router.post("/api/v1/admin/cache/clear", dependencies=[Depends(verify_api_key)])
 async def clear_local_cache_api(data: dict):
     """清理本地缓存"""
-    from app.services.grok.assets import DownloadService
+    from app.services.grok.services.assets import DownloadService
 
     cache_type = data.get("type", "image")
 
@@ -1013,7 +1362,7 @@ async def list_local_cache_api(
     page_size: int = 1000,
 ):
     """列出本地缓存文件"""
-    from app.services.grok.assets import DownloadService
+    from app.services.grok.services.assets import DownloadService
 
     try:
         if type_:
@@ -1028,7 +1377,7 @@ async def list_local_cache_api(
 @router.post("/api/v1/admin/cache/item/delete", dependencies=[Depends(verify_api_key)])
 async def delete_local_cache_item_api(data: dict):
     """删除单个本地缓存文件"""
-    from app.services.grok.assets import DownloadService
+    from app.services.grok.services.assets import DownloadService
 
     cache_type = data.get("type", "image")
     name = data.get("name")
@@ -1045,9 +1394,9 @@ async def delete_local_cache_item_api(data: dict):
 @router.post("/api/v1/admin/cache/online/clear", dependencies=[Depends(verify_api_key)])
 async def clear_online_cache_api(data: dict):
     """清理在线缓存"""
-    from app.services.grok.assets import DeleteService
+    from app.services.grok.services.assets import DeleteService
     from app.services.token.manager import get_token_manager
-    from app.services.grok.batch import run_in_batches
+    from app.services.grok.utils.batch import run_in_batches
 
     delete_service = None
     try:
@@ -1137,9 +1486,9 @@ async def clear_online_cache_api(data: dict):
 )
 async def clear_online_cache_api_async(data: dict):
     """清理在线缓存（异步批量 + SSE 进度）"""
-    from app.services.grok.assets import DeleteService
+    from app.services.grok.services.assets import DeleteService
     from app.services.token.manager import get_token_manager
-    from app.services.grok.batch import run_in_batches
+    from app.services.grok.utils.batch import run_in_batches
 
     mgr = await get_token_manager()
     tokens = data.get("tokens")

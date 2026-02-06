@@ -59,6 +59,16 @@ function downloadTextFile(content, filename) {
   document.body.removeChild(a);
 }
 
+async function readJsonResponse(res) {
+  const text = await res.text();
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch (err) {
+    throw new Error(`响应不是有效 JSON (HTTP ${res.status})`);
+  }
+}
+
 function getSelectedTokens() {
   return flatTokens.filter(t => t._selected);
 }
@@ -142,7 +152,13 @@ function processTokens(data) {
             note: t.note || '',
             fail_count: t.fail_count || 0,
             use_count: t.use_count || 0,
-            tags: t.tags || []
+            tags: t.tags || [],
+            created_at: t.created_at,
+            last_used_at: t.last_used_at,
+            last_fail_at: t.last_fail_at,
+            last_fail_reason: t.last_fail_reason,
+            last_sync_at: t.last_sync_at,
+            last_asset_clear_at: t.last_asset_clear_at
           };
         flatTokens.push({ ...tObj, pool: pool, _selected: false });
       });
@@ -501,14 +517,22 @@ async function syncToServer() {
   const newTokens = {};
   flatTokens.forEach(t => {
     if (!newTokens[t.pool]) newTokens[t.pool] = [];
-    newTokens[t.pool].push({
+    const payload = {
       token: t.token,
       status: t.status,
       quota: t.quota,
       note: t.note,
       fail_count: t.fail_count,
-      use_count: t.use_count || 0
-    });
+      use_count: t.use_count || 0,
+      tags: Array.isArray(t.tags) ? t.tags : []
+    };
+    if (typeof t.created_at === 'number') payload.created_at = t.created_at;
+    if (typeof t.last_used_at === 'number') payload.last_used_at = t.last_used_at;
+    if (typeof t.last_fail_at === 'number') payload.last_fail_at = t.last_fail_at;
+    if (typeof t.last_sync_at === 'number') payload.last_sync_at = t.last_sync_at;
+    if (typeof t.last_asset_clear_at === 'number') payload.last_asset_clear_at = t.last_asset_clear_at;
+    if (typeof t.last_fail_reason === 'string' && t.last_fail_reason) payload.last_fail_reason = t.last_fail_reason;
+    newTokens[t.pool].push(payload);
   });
 
   try {
@@ -553,6 +577,8 @@ async function submitImport() {
         status: 'active',
         quota: defaultQuota,
         note: '',
+        tags: [],
+        fail_count: 0,
         use_count: 0,
         _selected: false
       });
@@ -744,6 +770,10 @@ function finishBatchProcess(aborted = false, options = {}) {
       showToast('已终止删除', 'info');
     } else if (action === 'nsfw') {
       showToast('已终止 NSFW', 'info');
+    } else if (action === 'nsfw_enable_all') {
+      showToast('已终止全部开启 NSFW', 'info');
+    } else if (action === 'nsfw_disable_all') {
+      showToast('已终止全部关闭 NSFW', 'info');
     } else {
       showToast('已终止刷新', 'info');
     }
@@ -752,6 +782,10 @@ function finishBatchProcess(aborted = false, options = {}) {
       showToast('删除完成', 'success');
     } else if (action === 'nsfw') {
       showToast('NSFW 开启完成', 'success');
+    } else if (action === 'nsfw_enable_all') {
+      showToast('全部开启 NSFW 完成', 'success');
+    } else if (action === 'nsfw_disable_all') {
+      showToast('全部关闭 NSFW 完成', 'success');
     } else {
       showToast('刷新完成', 'success');
     }
@@ -792,10 +826,15 @@ function setActionButtonsState(selectedCount = null) {
   const exportBtn = byId('btn-batch-export');
   const updateBtn = byId('btn-batch-update');
   const nsfwBtn = byId('btn-batch-nsfw');
+  const nsfwEnableAllBtn = byId('btn-nsfw-enable-all');
+  const nsfwDisableAllBtn = byId('btn-nsfw-disable-all');
   const deleteBtn = byId('btn-batch-delete');
+  const total = flatTokens.length;
   if (exportBtn) exportBtn.disabled = disabled || count === 0;
   if (updateBtn) updateBtn.disabled = disabled || count === 0;
   if (nsfwBtn) nsfwBtn.disabled = disabled || count === 0;
+  if (nsfwEnableAllBtn) nsfwEnableAllBtn.disabled = disabled || total === 0;
+  if (nsfwDisableAllBtn) nsfwDisableAllBtn.disabled = disabled || total === 0;
   if (deleteBtn) deleteBtn.disabled = disabled || count === 0;
 }
 
@@ -1022,8 +1061,15 @@ async function batchEnableNSFW() {
       body: JSON.stringify({ tokens })
     });
 
-    const data = await res.json();
-    if (!res.ok || data.status !== 'success') {
+    const data = await readJsonResponse(res);
+    if (!res.ok) {
+      const detail = data && (data.detail || data.message);
+      throw new Error(detail || `HTTP ${res.status}`);
+    }
+    if (!data) {
+      throw new Error(`空响应 (HTTP ${res.status})`);
+    }
+    if (data.status !== 'success') {
       throw new Error(data.detail || '请求失败');
     }
 
@@ -1085,6 +1131,138 @@ async function batchEnableNSFW() {
     if (btn) btn.disabled = false;
     setActionButtonsState();
   }
+}
+
+async function runNSFWAll(action) {
+  if (isBatchProcessing) {
+    showToast('当前有任务进行中', 'info');
+    return;
+  }
+
+  const total = flatTokens.length;
+  if (total === 0) {
+    showToast('当前没有可处理账号', 'error');
+    return;
+  }
+
+  const enable = action === 'enable';
+  const actionText = enable ? '开启' : '关闭';
+  const endpoint = enable
+    ? '/api/v1/admin/tokens/nsfw/enable/async'
+    : '/api/v1/admin/tokens/nsfw/disable/async';
+  const actionKey = enable ? 'nsfw_enable_all' : 'nsfw_disable_all';
+
+  const ok = await confirmAction(
+    `是否为全部 ${total} 个账号${actionText} NSFW 模式？`,
+    { okText: `全部${actionText}` }
+  );
+  if (!ok) return;
+
+  const enableBtn = byId('btn-nsfw-enable-all');
+  const disableBtn = byId('btn-nsfw-disable-all');
+  if (enableBtn) enableBtn.disabled = true;
+  if (disableBtn) disableBtn.disabled = true;
+
+  isBatchProcessing = true;
+  currentBatchAction = actionKey;
+  batchTotal = total;
+  batchProcessed = 0;
+  updateBatchProgress();
+  setActionButtonsState();
+
+  try {
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...buildAuthHeaders(apiKey)
+      },
+      body: JSON.stringify({})
+    });
+
+    const data = await readJsonResponse(res);
+    if (!res.ok) {
+      const detail = data && (data.detail || data.message);
+      throw new Error(detail || `HTTP ${res.status}`);
+    }
+    if (!data) {
+      throw new Error(`空响应 (HTTP ${res.status})`);
+    }
+    if (data.status !== 'success') {
+      throw new Error(data.detail || '请求失败');
+    }
+
+    currentBatchTaskId = data.task_id;
+    BatchSSE.close(batchEventSource);
+    batchEventSource = BatchSSE.open(currentBatchTaskId, apiKey, {
+      onMessage: (msg) => {
+        if (msg.type === 'snapshot' || msg.type === 'progress') {
+          if (typeof msg.total === 'number') batchTotal = msg.total;
+          if (typeof msg.processed === 'number') batchProcessed = msg.processed;
+          updateBatchProgress();
+        } else if (msg.type === 'done') {
+          if (typeof msg.total === 'number') batchTotal = msg.total;
+          batchProcessed = batchTotal;
+          updateBatchProgress();
+          finishBatchProcess(false, { silent: true });
+          const summary = msg.result && msg.result.summary ? msg.result.summary : null;
+          const okCount = summary ? summary.ok : 0;
+          const failCount = summary ? summary.fail : 0;
+          let text = `NSFW ${actionText}完成：成功 ${okCount}，失败 ${failCount}`;
+          if (msg.warning) text += `\n⚠️ ${msg.warning}`;
+          showToast(text, failCount > 0 || msg.warning ? 'warning' : 'success');
+          currentBatchTaskId = null;
+          BatchSSE.close(batchEventSource);
+          batchEventSource = null;
+          if (enableBtn) enableBtn.disabled = false;
+          if (disableBtn) disableBtn.disabled = false;
+          setActionButtonsState();
+        } else if (msg.type === 'cancelled') {
+          finishBatchProcess(true, { silent: true });
+          showToast(`已终止 NSFW ${actionText}`, 'info');
+          currentBatchTaskId = null;
+          BatchSSE.close(batchEventSource);
+          batchEventSource = null;
+          if (enableBtn) enableBtn.disabled = false;
+          if (disableBtn) disableBtn.disabled = false;
+          setActionButtonsState();
+        } else if (msg.type === 'error') {
+          finishBatchProcess(true, { silent: true });
+          showToast(`${actionText}失败: ` + (msg.error || '未知错误'), 'error');
+          currentBatchTaskId = null;
+          BatchSSE.close(batchEventSource);
+          batchEventSource = null;
+          if (enableBtn) enableBtn.disabled = false;
+          if (disableBtn) disableBtn.disabled = false;
+          setActionButtonsState();
+        }
+      },
+      onError: () => {
+        finishBatchProcess(true, { silent: true });
+        showToast('连接中断', 'error');
+        currentBatchTaskId = null;
+        BatchSSE.close(batchEventSource);
+        batchEventSource = null;
+        if (enableBtn) enableBtn.disabled = false;
+        if (disableBtn) disableBtn.disabled = false;
+        setActionButtonsState();
+      }
+    });
+  } catch (e) {
+    finishBatchProcess(true, { silent: true });
+    showToast('请求错误: ' + e.message, 'error');
+    if (enableBtn) enableBtn.disabled = false;
+    if (disableBtn) disableBtn.disabled = false;
+    setActionButtonsState();
+  }
+}
+
+async function batchEnableNSFWAll() {
+  return runNSFWAll('enable');
+}
+
+async function batchDisableNSFWAll() {
+  return runNSFWAll('disable');
 }
 
 

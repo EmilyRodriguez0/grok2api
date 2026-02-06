@@ -8,8 +8,8 @@ from fastapi import APIRouter
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
-from app.services.grok.chat import ChatService
-from app.services.grok.model import ModelService
+from app.services.grok.services.chat import ChatService
+from app.services.grok.models.model import ModelService
 from app.core.exceptions import ValidationException
 
 
@@ -109,7 +109,7 @@ class ChatCompletionRequest(BaseModel):
 
     model: str = Field(..., description="模型名称")
     messages: List[MessageItem] = Field(..., description="消息数组")
-    stream: bool = Field(False, description="是否流式输出")
+    stream: Optional[bool] = Field(None, description="是否流式输出")
     thinking: Optional[str] = Field(None, description="思考模式: enabled/disabled/None")
 
     # 视频生成配置
@@ -120,7 +120,7 @@ class ChatCompletionRequest(BaseModel):
     def validate_stream(cls, v):
         """确保 stream 参数被正确解析为布尔值"""
         if v is None:
-            return False
+            return None
         if isinstance(v, bool):
             return v
         if isinstance(v, str):
@@ -260,7 +260,7 @@ async def chat_completions(request: ChatCompletionRequest):
     # 检测视频模型
     model_info = ModelService.get(request.model)
     if model_info and model_info.is_video:
-        from app.services.grok.media import VideoService
+        from app.services.grok.services.media import VideoService
 
         # 提取视频配置 (默认值在 Pydantic 模型中处理)
         v_conf = request.video_config or VideoConfig()

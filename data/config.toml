@@ -1,6 +1,6 @@
 [grok]
 temporary = true
-stream = true
+stream = false
 thinking = true
 dynamic_statsig = true
 filter_tags = ["xaiartifact","xai:tool_usage_card","grok:render"]
@@ -14,7 +14,7 @@ retry_backoff_base = 0.5
 retry_backoff_factor = 2.0
 retry_backoff_max = 30.0
 retry_budget = 90.0
-stream_idle_timeout = 45.0
+stream_idle_timeout = 120.0
 video_idle_timeout = 90.0
 
 [app]
@@ -29,7 +29,7 @@ auto_refresh = true
 refresh_interval_hours = 8
 super_refresh_interval_hours = 2
 fail_threshold = 5
-save_delay_ms = 500
+save_delay_ms = 200
 reload_interval_sec = 30
 
 [cache]

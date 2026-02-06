@@ -9,7 +9,7 @@
   <script src="https://cdn.tailwindcss.com"></script>
   <link href="https://cdn.jsdelivr.net/npm/geist@1.0.0/dist/fonts/geist-sans/style.css" rel="stylesheet">
   <link href="https://cdn.jsdelivr.net/npm/geist@1.0.0/dist/fonts/geist-mono/style.css" rel="stylesheet">
-  <link href="/static/common/common.css?v=2" rel="stylesheet">
+  <link href="/static/common/common.css?v=3" rel="stylesheet">
   <link href="/static/token/token.css?v=11" rel="stylesheet">
   <link href="/static/common/toast.css" rel="stylesheet">
 </head>
@@ -189,6 +189,14 @@
         class="geist-button-outline text-xs px-3 gap-1 border-0 hover:bg-gray-100 justify-center" disabled>
         NSFW
       </button>
+      <button id="btn-nsfw-enable-all" onclick="batchEnableNSFWAll()"
+        class="geist-button-outline text-xs px-3 gap-1 border-0 hover:bg-gray-100 justify-center">
+        全部开启NSFW
+      </button>
+      <button id="btn-nsfw-disable-all" onclick="batchDisableNSFWAll()"
+        class="geist-button-outline text-xs px-3 gap-1 border-0 hover:bg-gray-100 justify-center">
+        全部关闭NSFW
+      </button>
       <button id="btn-batch-delete" onclick="batchDelete()" class="geist-button-danger text-xs px-3">
         删除
       </button>
@@ -294,10 +302,10 @@
   <script src="/static/common/draggable.js"></script>
   <script src="/static/common/admin-auth.js?v=2"></script>
   <script src="/static/common/batch-sse.js?v=1"></script>
-  <script src="/static/common/header.js?v=2"></script>
+  <script src="/static/common/header.js?v=3"></script>
   <script src="/static/common/footer.js?v=1"></script>
   <script src="/static/common/toast.js"></script>
-  <script src="/static/token/token.js?v=18"></script>
+  <script src="/static/token/token.js?v=20"></script>
 </body>
 
 </html>

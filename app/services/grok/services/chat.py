@@ -2,7 +2,6 @@
 Grok Chat 服务
 """
 
-import uuid
 import orjson
 from typing import Dict, List, Any, AsyncGenerator
 from dataclasses import dataclass
@@ -17,11 +16,11 @@ from app.core.exceptions import (
     ValidationException,
     ErrorType,
 )
-from app.services.grok.statsig import StatsigService
-from app.services.grok.model import ModelService
-from app.services.grok.assets import UploadService
-from app.services.grok.processor import StreamProcessor, CollectProcessor
-from app.services.grok.retry import retry_on_status
+from app.services.grok.models.model import ModelService
+from app.services.grok.services.assets import UploadService
+from app.services.grok.processors.processor import StreamProcessor, CollectProcessor
+from app.services.grok.utils.retry import retry_on_status
+from app.services.grok.utils.headers import apply_statsig, build_sso_cookie
 from app.services.token import get_token_manager, EffortType
 
 
@@ -51,7 +50,7 @@ class MessageExtractor:
     @staticmethod
     def extract(
         messages: List[Dict[str, Any]], is_video: bool = False
-    ) -> tuple[str, List[str]]:
+    ) -> tuple[str, List[tuple[str, str]]]:
         """
         从 OpenAI 消息格式提取内容
 
@@ -186,14 +185,8 @@ class ChatRequestBuilder:
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
         }
 
-        # Statsig ID
-        headers["x-statsig-id"] = StatsigService.gen_id()
-        headers["x-xai-request-id"] = str(uuid.uuid4())
-
-        # Cookie
-        token = token[4:] if token.startswith("sso=") else token
-        cf = get_config("grok.cf_clearance", "")
-        headers["Cookie"] = f"sso={token};cf_clearance={cf}" if cf else f"sso={token}"
+        apply_statsig(headers)
+        headers["Cookie"] = build_sso_cookie(token)
 
         return headers
 
@@ -201,7 +194,7 @@ class ChatRequestBuilder:
     def build_payload(
         message: str,
         model: str,
-        mode: str,
+        mode: str = None,
         think: bool = None,
         file_attachments: List[str] = None,
         image_attachments: List[str] = None,
@@ -227,10 +220,9 @@ class ChatRequestBuilder:
         if image_attachments:
             merged_attachments.extend(image_attachments)
 
-        return {
+        payload = {
             "temporary": temporary,
             "modelName": model,
-            "modelMode": mode,
             "message": message,
             "fileAttachments": merged_attachments,
             "imageAttachments": [],
@@ -250,7 +242,7 @@ class ChatRequestBuilder:
                 "modelConfigOverride": {"modelMap": {}},
                 "requestModelDetails": {"modelId": model},
             },
-            "disableMemory": False,
+            "disableMemory": get_config("grok.disable_memory", True),
             "forceSideBySide": False,
             "isAsyncChat": False,
             "disableSelfHarmShortCircuit": False,
@@ -263,6 +255,11 @@ class ChatRequestBuilder:
                 "viewportHeight": 1083,
             },
         }
+
+        if mode:
+            payload["modelMode"] = mode
+
+        return payload
 
 
 # ==================== Grok 服务 ====================
@@ -279,9 +276,9 @@ class GrokChatService:
         token: str,
         message: str,
         model: str = "grok-3",
-        mode: str = "MODEL_MODE_FAST",
-        think: bool = None,
+        mode: str = None,
         stream: bool = None,
+        think: bool = None,
         file_attachments: List[str] = None,
         image_attachments: List[str] = None,
     ):
@@ -293,16 +290,16 @@ class GrokChatService:
             message: 消息文本
             model: Grok 模型名称
             mode: 模型模式
-            think: 是否开启思考
             stream: 是否流式
+            think: 是否开启思考
             file_attachments: 文件附件 ID 列表
             image_attachments: 图片附件 URL 列表
 
         Raises:
             UpstreamException: 当 Grok API 返回错误且重试耗尽时
         """
-        # stream 默认值已在 API 层处理，这里直接使用
-        stream = True if stream is True else False
+        if stream is None:
+            stream = get_config("grok.stream", True)
 
         headers = ChatRequestBuilder.build_headers(token)
         payload = ChatRequestBuilder.build_payload(
@@ -334,16 +331,25 @@ class GrokChatService:
                 if response.status_code != 200:
                     try:
                         content = await response.text()
-                        content = content[:1000]  # 限制长度避免日志过大
                     except Exception:
-                        content = "Unable to read response content"
+                        content = ""
 
                     logger.error(
-                        f"Chat failed: {response.status_code}, {content}",
+                        f"Chat failed: {response.status_code}",
                         extra={
                             "status": response.status_code,
                             "token": token[:10] + "...",
                         },
+                    )
+                    resp_headers = {}
+                    try:
+                        resp_headers = dict(response.headers)
+                    except Exception:
+                        resp_headers = {}
+                    body_for_log = content if content else "<empty>"
+                    logger.debug(
+                        "Grok API error response "
+                        f"(status={response.status_code}, headers={resp_headers}): {body_for_log}"
                     )
                     # 关闭 session 并抛出异常
                     try:
@@ -352,7 +358,11 @@ class GrokChatService:
                         pass
                     raise UpstreamException(
                         message=f"Grok API request failed: {response.status_code}",
-                        details={"status": response.status_code},
+                        details={
+                            "status": response.status_code,
+                            "body": content,
+                            "headers": resp_headers,
+                        },
                     )
 
                 # 返回 session 和 response
@@ -385,7 +395,12 @@ class GrokChatService:
             status_code = extract_status(e)
             if status_code:
                 token_mgr = await get_token_manager()
-                await token_mgr.record_fail(token, status_code, str(e))
+                reason = str(e)
+                if isinstance(e, UpstreamException) and e.details:
+                    body = e.details.get("body")
+                    if body:
+                        reason = f"{reason} | body: {body}"
+                await token_mgr.record_fail(token, status_code, reason)
             raise
 
         # 流式传输
@@ -436,12 +451,10 @@ class GrokChatService:
             finally:
                 await upload_service.close()
 
-        # stream 默认值已在 API 层处理为 False
-        stream = True if request.stream is True else False
-        think = (
-            request.think
-            if request.think is not None
-            else get_config("grok.thinking", False)
+        stream = (
+            request.stream
+            if request.stream is not None
+            else get_config("grok.stream", True)
         )
 
         response = await self.chat(
@@ -449,8 +462,8 @@ class GrokChatService:
             message,
             grok_model,
             mode,
-            think,
             stream,
+            request.think,
             file_attachments=file_ids,
             image_attachments=[],
         )
@@ -548,8 +561,7 @@ class ChatService:
         elif thinking == "disabled":
             think = False
 
-        # stream 默认值已在 API 层处理为 False
-        is_stream = True if stream is True else False
+        is_stream = stream if stream is not None else get_config("grok.stream", True)
 
         # 构造请求
         chat_request = ChatRequest(

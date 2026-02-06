@@ -1,7 +1,5 @@
 [grok]
 temporary = true
-# DEPRECATED: stream 配置已弃用，API 默认行为由请求参数控制
-# 默认非流式，只有显式传递 stream=true 才启用流式响应
 stream = false
 thinking = true
 dynamic_statsig = true
@@ -18,7 +16,7 @@ retry_backoff_factor = 2.0
 retry_backoff_max = 30.0
 retry_budget = 90.0
 # 流空闲超时配置 (秒)
-stream_idle_timeout = 45.0
+stream_idle_timeout = 120.0
 video_idle_timeout = 90.0
 
 [app]
