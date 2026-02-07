@@ -37,6 +37,9 @@ class ChatRequest:
     messages: List[Dict[str, Any]]
     stream: bool = False
     think: bool = None
+    enable_nsfw: bool | None = None
+    image_aspect_ratio: str | None = None
+    image_generation_count: int | None = None
 
 
 class MessageExtractor:
@@ -198,6 +201,9 @@ class ChatRequestBuilder:
         think: bool = None,
         file_attachments: List[str] = None,
         image_attachments: List[str] = None,
+        enable_nsfw: bool | None = None,
+        image_aspect_ratio: str | None = None,
+        image_generation_count: int | None = None,
     ) -> Dict[str, Any]:
         """
         构造请求体
@@ -209,6 +215,9 @@ class ChatRequestBuilder:
             think: 是否开启思考
             file_attachments: 文件附件 ID 列表
             image_attachments: 图片附件 ID 列表（合并到 fileAttachments）
+            enable_nsfw: 图片生成是否允许 NSFW
+            image_aspect_ratio: 图片宽高比（如 1:1、2:3）
+            image_generation_count: 单次请求生成图片数量
         """
         temporary = get_config("grok.temporary", True)
         if think is None:
@@ -231,7 +240,7 @@ class ChatRequestBuilder:
             "returnImageBytes": False,
             "returnRawGrokInXaiRequest": False,
             "enableImageStreaming": True,
-            "imageGenerationCount": 2,
+            "imageGenerationCount": image_generation_count or 2,
             "forceConcise": False,
             "toolOverrides": {},
             "enableSideBySide": True,
@@ -259,6 +268,18 @@ class ChatRequestBuilder:
         if mode:
             payload["modelMode"] = mode
 
+        # imagine2api 融合：按请求显式携带 NSFW 与宽高比参数（未知字段上游通常忽略）
+        if enable_nsfw is not None:
+            nsfw_enabled = bool(enable_nsfw)
+            payload["enableNsfw"] = nsfw_enabled
+            payload["enable_nsfw"] = nsfw_enabled
+            payload["isKidsMode"] = not nsfw_enabled
+            payload["is_kids_mode"] = not nsfw_enabled
+
+        if image_aspect_ratio:
+            payload["aspectRatio"] = image_aspect_ratio
+            payload["aspect_ratio"] = image_aspect_ratio
+
         return payload
 
 
@@ -281,6 +302,9 @@ class GrokChatService:
         think: bool = None,
         file_attachments: List[str] = None,
         image_attachments: List[str] = None,
+        enable_nsfw: bool | None = None,
+        image_aspect_ratio: str | None = None,
+        image_generation_count: int | None = None,
     ):
         """
         发送聊天请求
@@ -300,7 +324,15 @@ class GrokChatService:
         """
         headers = ChatRequestBuilder.build_headers(token)
         payload = ChatRequestBuilder.build_payload(
-            message, model, mode, think, file_attachments, image_attachments
+            message,
+            model,
+            mode,
+            think,
+            file_attachments,
+            image_attachments,
+            enable_nsfw,
+            image_aspect_ratio,
+            image_generation_count,
         )
         proxies = {"http": self.proxy, "https": self.proxy} if self.proxy else None
         timeout = get_config("grok.timeout", TIMEOUT)
@@ -459,6 +491,9 @@ class GrokChatService:
             request.think,
             file_attachments=file_ids,
             image_attachments=[],
+            enable_nsfw=request.enable_nsfw,
+            image_aspect_ratio=request.image_aspect_ratio,
+            image_generation_count=request.image_generation_count,
         )
 
         return response, stream, request.model
@@ -556,9 +591,18 @@ class ChatService:
 
         is_stream = True if stream is True else False
 
+        model_info = ModelService.get(model)
+        enable_nsfw = None
+        if model_info and model_info.is_image:
+            enable_nsfw = token_mgr.has_tag(token, "nsfw")
+
         # 构造请求
         chat_request = ChatRequest(
-            model=model, messages=messages, stream=is_stream, think=think
+            model=model,
+            messages=messages,
+            stream=is_stream,
+            think=think,
+            enable_nsfw=enable_nsfw,
         )
 
         # 请求 Grok

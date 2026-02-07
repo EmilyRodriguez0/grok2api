@@ -433,6 +433,24 @@ class TokenManager:
                 return True
         return False
 
+    def has_tag(self, token: str, tag: str) -> bool:
+        """
+        检查 Token 是否包含指定标签
+
+        Args:
+            token: Token 字符串
+            tag: 标签名称
+
+        Returns:
+            是否包含标签
+        """
+        raw_token = token[4:] if token.startswith("sso=") else token
+        for pool in self.pools.values():
+            info = pool.get(raw_token)
+            if info:
+                return tag in info.tags
+        return False
+
     async def remove(self, token: str) -> bool:
         """
         删除 Token

@@ -13,6 +13,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field, ValidationError
 
 from app.services.grok.services.chat import GrokChatService
+from app.services.grok.services.imagine_ws import ImagineWSService
 from app.services.grok.services.assets import UploadService
 from app.services.grok.models.model import ModelService
 from app.services.grok.processors.processor import ImageStreamProcessor, ImageCollectProcessor
@@ -119,6 +120,19 @@ def response_field_name(response_format: str) -> str:
     return "b64_json"
 
 
+def size_to_aspect_ratio(size: Optional[str]) -> str:
+    """将 OpenAI size 转换为 Grok aspect_ratio"""
+    size_map = {
+        "1024x1024": "1:1",
+        "1024x1536": "2:3",
+        "1536x1024": "3:2",
+        "512x512": "1:1",
+        "256x256": "1:1",
+    }
+    value = str(size or "1024x1024").lower()
+    return size_map.get(value, "1:1")
+
+
 def validate_edit_request(request: ImageEditRequest, images: List[UploadFile]):
     """验证图片编辑请求参数"""
     validate_generation_request(request)
@@ -143,12 +157,39 @@ async def call_grok(
     model_info,
     file_attachments: Optional[List[str]] = None,
     response_format: str = "b64_json",
+    enable_nsfw: Optional[bool] = None,
+    aspect_ratio: Optional[str] = None,
+    image_count: Optional[int] = 2,
 ) -> List[str]:
     """调用 Grok 获取图片，返回 base64 列表"""
-    chat_service = GrokChatService()
     success = False
 
     try:
+        # 生图模型优先走 WS 接口（无附件场景）
+        if model_info and model_info.is_image and not file_attachments:
+            ws_service = ImagineWSService()
+            result = await ws_service.generate(
+                token=token,
+                prompt=prompt,
+                aspect_ratio=aspect_ratio or "1:1",
+                max_images=image_count or 2,
+                enable_nsfw=enable_nsfw,
+            )
+            if result.get("success"):
+                images = (
+                    result.get("urls", [])
+                    if response_format == "url"
+                    else result.get("b64_list", [])
+                )
+                success = len(images) > 0
+                return images
+
+            logger.warning(
+                "WS image call failed, fallback to REST",
+                extra={"error": result.get("error"), "code": result.get("error_code")},
+            )
+
+        chat_service = GrokChatService()
         response = await chat_service.chat(
             token=token,
             message=prompt,
@@ -156,6 +197,9 @@ async def call_grok(
             mode=model_info.model_mode,
             stream=True,
             file_attachments=file_attachments,
+            enable_nsfw=enable_nsfw,
+            image_aspect_ratio=aspect_ratio,
+            image_generation_count=image_count,
         )
 
         # 收集图片
@@ -163,7 +207,7 @@ async def call_grok(
             model_info.model_id, token, response_format=response_format
         )
         images = await processor.process(response)
-        success = True
+        success = len(images) > 0
         return images
 
     except Exception as e:
@@ -235,29 +279,21 @@ async def create_image(request: ImageGenerationRequest):
 
     # 获取模型信息
     model_info = ModelService.get(request.model)
+    aspect_ratio = size_to_aspect_ratio(request.size)
+    token_nsfw_enabled = token_mgr.has_tag(token, "nsfw")
 
     # 流式模式
     if request.stream:
-        chat_service = GrokChatService()
-        response = await chat_service.chat(
-            token=token,
-            message=f"Image Generation: {request.prompt}",
-            model=model_info.grok_model,
-            mode=model_info.model_mode,
-            stream=True,
-        )
-
-        processor = ImageStreamProcessor(
-            model_info.model_id, token, n=request.n, response_format=response_format
-        )
+        ws_service = ImagineWSService()
 
         # 包装流式响应，在成功完成时记录使用
         async def _wrap_stream(stream):
             success = False
             try:
                 async for chunk in stream:
+                    if "event: image_generation.completed" in chunk:
+                        success = True
                     yield chunk
-                success = True
             finally:
                 # 只在成功完成时扣费
                 if success:
@@ -272,7 +308,16 @@ async def create_image(request: ImageGenerationRequest):
                         logger.warning(f"Failed to consume token: {e}")
 
         return StreamingResponse(
-            _wrap_stream(processor.process(response)),
+            _wrap_stream(
+                ws_service.stream_sse(
+                    token=token,
+                    prompt=request.prompt,
+                    aspect_ratio=aspect_ratio,
+                    max_images=min(request.n, 2),
+                    enable_nsfw=token_nsfw_enabled,
+                    response_format=response_format,
+                )
+            ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
         )
@@ -287,9 +332,12 @@ async def create_image(request: ImageGenerationRequest):
         all_images = await call_grok(
             token_mgr,
             token,
-            f"Image Generation: {request.prompt}",
+            request.prompt,
             model_info,
             response_format=response_format,
+            enable_nsfw=token_nsfw_enabled,
+            aspect_ratio=aspect_ratio,
+            image_count=min(request.n, 2),
         )
     else:
         # 并发调用
@@ -297,9 +345,12 @@ async def create_image(request: ImageGenerationRequest):
             call_grok(
                 token_mgr,
                 token,
-                f"Image Generation: {request.prompt}",
+                request.prompt,
                 model_info,
                 response_format=response_format,
+                enable_nsfw=token_nsfw_enabled,
+                aspect_ratio=aspect_ratio,
+                image_count=min(request.n, 2),
             )
             for _ in range(calls_needed)
         ]
@@ -465,6 +516,8 @@ async def edit_image(
 
     # 获取模型信息
     model_info = ModelService.get(edit_request.model)
+    aspect_ratio = size_to_aspect_ratio(edit_request.size)
+    token_nsfw_enabled = token_mgr.has_tag(token, "nsfw")
 
     # 上传图片
     file_ids: List[str] = []
@@ -486,6 +539,9 @@ async def edit_image(
             mode=model_info.model_mode,
             stream=True,
             file_attachments=file_ids,
+            enable_nsfw=token_nsfw_enabled,
+            image_aspect_ratio=aspect_ratio,
+            image_generation_count=min(edit_request.n, 2),
         )
 
         processor = ImageStreamProcessor(
@@ -528,6 +584,9 @@ async def edit_image(
             model_info,
             file_attachments=file_ids,
             response_format=response_format,
+            enable_nsfw=token_nsfw_enabled,
+            aspect_ratio=aspect_ratio,
+            image_count=min(edit_request.n, 2),
         )
     else:
         tasks = [
@@ -538,6 +597,9 @@ async def edit_image(
                 model_info,
                 file_attachments=file_ids,
                 response_format=response_format,
+                enable_nsfw=token_nsfw_enabled,
+                aspect_ratio=aspect_ratio,
+                image_count=min(edit_request.n, 2),
             )
             for _ in range(calls_needed)
         ]
