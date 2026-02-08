@@ -268,18 +268,6 @@ class ChatRequestBuilder:
         if mode:
             payload["modelMode"] = mode
 
-        # imagine2api 融合：按请求显式携带 NSFW 与宽高比参数（未知字段上游通常忽略）
-        if enable_nsfw is not None:
-            nsfw_enabled = bool(enable_nsfw)
-            payload["enableNsfw"] = nsfw_enabled
-            payload["enable_nsfw"] = nsfw_enabled
-            payload["isKidsMode"] = not nsfw_enabled
-            payload["is_kids_mode"] = not nsfw_enabled
-
-        if image_aspect_ratio:
-            payload["aspectRatio"] = image_aspect_ratio
-            payload["aspect_ratio"] = image_aspect_ratio
-
         return payload
 
 
